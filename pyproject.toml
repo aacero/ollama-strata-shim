@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ollama-strata-shim"
+version = "0.1.0"
+description = "Lightweight Ollama-to-OpenAI/Strata API proxy with Chromium Private Network Access (PNA) and tool-calling support"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Tony Acero" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+ollama-strata-shim = "shim:main"
+
+[tool.hatch.build.targets.wheel]
+sources = ["."]
+only-include = ["shim.py"]

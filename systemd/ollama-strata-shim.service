@@ -1,0 +1,16 @@
+[Unit]
+Description=Ollama to Strata / OpenAI API Shim
+After=network.target strata.service
+Wants=strata.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/src/ollama-strata-shim
+ExecStart=%h/src/ollama-strata-shim/.venv/bin/python %h/src/ollama-strata-shim/shim.py --host 0.0.0.0 --port 11434
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
