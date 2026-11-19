@@ -11,7 +11,7 @@ Originally built to connect mobile apps, PWAs, and local tools expecting an Olla
 - **Full Streaming & Non-Streaming Translation:** Seamlessly bridges Server-Sent Events (SSE) from OpenAI backends into Ollama NDJSON streams (`/api/chat` and `/api/generate`).
 - **Chromium Private Network Access (PNA) Compliant:** Implements `Access-Control-Allow-Private-Network: true` and preflight handling. Prevents `TypeError: Failed to fetch` errors when secure WebViews, PWAs (`https://localhost`), or browser clients make requests to local network/loopback daemons.
 - **Thinking / Reasoning Passthrough:** Extracts reasoning tokens (`reasoning_content`) from models like Qwen 2.5/3 or DeepSeek-R1 and maps them into Ollama's `message.thinking` delta streams.
-- **Tool Calling Support:** Preserves `tools` and `tool_calls` payloads across multi-turn assistant workflows.
+- **Bi-Directional Tool Calling Support:** Fully translates `tools`, `tool_choice`, and `tool_calls` across streaming (SSE-to-NDJSON) and non-streaming modes. Automatically handles multi-turn conversation history by normalizing stringified/dict tool arguments and correlating synthesized `tool_call_id`s with Ollama `role: "tool"` responses.
 - **Flexible Path Routing:** Automatically normalizes paths whether the client posts to root (`/`), `/chat/completions`, or standard `/v1/*` routes.
 - **Dynamic Model Discovery:** Queries the underlying backend's `/v1/models` and exposes active models plus standard aliases (`default:latest`, `qwen2.5-coder:32b`, etc.) in `/api/tags` and `/api/ps`.
 
@@ -76,6 +76,37 @@ To run automatically in the background across reboots:
    ```bash
    systemctl --user status ollama-strata-shim.service
    ```
+
+---
+
+## Configuring Zed AI (Agent Mode & Tool Calling)
+
+To use local models hosted on Strata through `ollama-strata-shim` in Zed's Agent panel (with file editing, terminal execution, and search tools):
+
+In `~/.config/zed/settings.json`:
+
+```json
+{
+  "language_models": {
+    "ollama": {
+      "api_url": "http://127.0.0.1:11434",
+      "auto_discover": false,
+      "available_models": [
+        {
+          "name": "qwen2.5-coder:32b",
+          "display_name": "Qwen 2.5 Coder 32B (Strata)",
+          "max_tokens": 32768,
+          "supports_tools": true,
+          "supports_thinking": true,
+          "supports_images": false
+        }
+      ]
+    }
+  }
+}
+```
+
+> **Note:** If connecting from another machine on your local network/Tailscale, replace `127.0.0.1` with the host's LAN or Tailscale IP (e.g. `http://llama:11434`).
 
 ---
 

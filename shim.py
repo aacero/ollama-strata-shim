@@ -4,6 +4,7 @@ Ollama-to-Strata API Shim
 Translates Ollama REST endpoints (/api/tags, /api/version, /api/show, /api/chat, /api/generate)
 into Strata's OpenAI-compatible API (/v1/chat/completions, /v1/models).
 Supports CORS Private Network Access (PNA) for Android WebView / PWA / browser clients.
+Supports bi-directional tool calling for agents (Zed, Open WebUI, etc.) across streaming and non-streaming modes.
 """
 
 import argparse
@@ -106,12 +107,12 @@ def build_model_entry(name: str) -> Dict[str, Any]:
         "size": 55430000000,
         "digest": "qwen38flashnext",
         "details": {
-          "parent_model": "",
-          "format": "gguf",
-          "family": "qwen2",
-          "families": ["qwen2"],
-          "parameter_size": "125B",
-          "quantization_level": "UD-IQ4_XS",
+            "parent_model": "",
+            "format": "gguf",
+            "family": "qwen2",
+            "families": ["qwen2"],
+            "parameter_size": "125B",
+            "quantization_level": "UD-IQ4_XS",
         },
     }
 
@@ -168,7 +169,12 @@ async def api_show(req: Request):
         "license": "Apache-2.0",
         "modelfile": f"# Modelfile for {name}\nFROM {DEFAULT_MODEL}\n",
         "parameters": 'stop "<|im_start|>"\nstop "<|im_end|>"',
-        "template": "{{ if .System }}<|im_start|>system\n{{ .System }}<|im_end|>\n{{ end }}{{ if .Prompt }}<|im_start|>user\n{{ .Prompt }}<|im_end|>\n{{ end }}<|im_start|>assistant\n{{ .Response }}<|im_end|>",
+        "template": (
+            "{{ if .System }}<|im_start|>system\n{{ .System }}<|im_end|>\n{{ end }}"
+            "{{ if .Tools }}<|im_start|>system\n# Tools\n{{ .Tools }}<|im_end|>\n{{ end }}"
+            "{{ if .Prompt }}<|im_start|>user\n{{ .Prompt }}<|im_end|>\n{{ end }}"
+            "<|im_start|>assistant\n{{ .Response }}<|im_end|>"
+        ),
         "details": {
             "parent_model": "",
             "format": "gguf",
@@ -177,6 +183,7 @@ async def api_show(req: Request):
             "parameter_size": "125B",
             "quantization_level": "UD-IQ4_XS",
         },
+        "capabilities": ["tools", "thinking"],
     }
 
 
@@ -194,26 +201,149 @@ def translate_options_to_openai(options: Optional[Dict[str, Any]]) -> Dict[str, 
         kw["max_tokens"] = options["max_tokens"]
     if "stop" in options:
         kw["stop"] = options["stop"]
+    if "seed" in options:
+        kw["seed"] = options["seed"]
+    if "presence_penalty" in options:
+        kw["presence_penalty"] = options["presence_penalty"]
+    if "frequency_penalty" in options:
+        kw["frequency_penalty"] = options["frequency_penalty"]
     return kw
+
+
+def ollama_request_to_openai(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate Ollama /api/chat payload (including tools & tool history) to OpenAI format."""
+    oa_messages: List[Dict[str, Any]] = []
+    pending_tool_ids: List[str] = []
+    tool_name_to_ids: Dict[str, List[str]] = {}
+    call_counter = 0
+
+    for msg in payload.get("messages", []):
+        role = msg.get("role")
+        content = msg.get("content", "")
+
+        if role == "assistant" and msg.get("tool_calls"):
+            oa_tool_calls = []
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function", {})
+                fn_name = fn.get("name", "")
+                args = fn.get("arguments", {})
+                if not isinstance(args, str):
+                    try:
+                        args_str = json.dumps(args)
+                    except Exception:
+                        args_str = str(args)
+                else:
+                    args_str = args
+
+                tc_id = tc.get("id") or f"call_{call_counter}"
+                call_counter += 1
+                pending_tool_ids.append(tc_id)
+                if fn_name:
+                    tool_name_to_ids.setdefault(fn_name, []).append(tc_id)
+
+                oa_tool_calls.append({
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {
+                        "name": fn_name,
+                        "arguments": args_str,
+                    },
+                })
+
+            oa_messages.append({
+                "role": "assistant",
+                "content": content if content else None,
+                "tool_calls": oa_tool_calls,
+            })
+
+        elif role == "tool":
+            # Correlate tool result message to an assistant tool_call_id
+            tc_id = msg.get("tool_call_id")
+            tool_name = msg.get("tool_name")
+            if not tc_id:
+                if tool_name and tool_name_to_ids.get(tool_name):
+                    tc_id = tool_name_to_ids[tool_name].pop(0)
+                    if tc_id in pending_tool_ids:
+                        pending_tool_ids.remove(tc_id)
+                elif pending_tool_ids:
+                    tc_id = pending_tool_ids.pop(0)
+                else:
+                    tc_id = f"call_{call_counter}"
+                    call_counter += 1
+
+            content_val = msg.get("content", "")
+            if not isinstance(content_val, str):
+                try:
+                    content_str = json.dumps(content_val)
+                except Exception:
+                    content_str = str(content_val)
+            else:
+                content_str = content_val
+
+            oa_messages.append({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": content_str,
+            })
+
+        else:
+            oa_messages.append({"role": role, "content": content})
+
+    oa_payload: Dict[str, Any] = {
+        "model": DEFAULT_MODEL,
+        "messages": oa_messages,
+        "stream": payload.get("stream", True),
+        **translate_options_to_openai(payload.get("options")),
+    }
+
+    if payload.get("tools"):
+        oa_payload["tools"] = payload["tools"]
+    if payload.get("tool_choice") is not None:
+        oa_payload["tool_choice"] = payload["tool_choice"]
+
+    return oa_payload
+
+
+def openai_tool_calls_to_ollama(oa_tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert OpenAI tool_calls list into Ollama's parsed-dict tool_calls format."""
+    ollama_calls = []
+    for tc in oa_tool_calls:
+        fn = tc.get("function", {})
+        raw_args = fn.get("arguments", "{}")
+        if isinstance(raw_args, str):
+            try:
+                parsed_args = json.loads(raw_args) if raw_args.strip() else {}
+            except json.JSONDecodeError:
+                parsed_args = {"_raw": raw_args}
+        elif isinstance(raw_args, dict):
+            parsed_args = raw_args
+        else:
+            parsed_args = {"_raw": str(raw_args)}
+
+        call_entry: Dict[str, Any] = {
+            "function": {
+                "name": fn.get("name", ""),
+                "arguments": parsed_args,
+            }
+        }
+        if tc.get("id"):
+            call_entry["id"] = tc["id"]
+        ollama_calls.append(call_entry)
+    return ollama_calls
 
 
 @app.post("/api/chat")
 async def api_chat(req: Request):
     data = await req.json()
     model = data.get("model") or DEFAULT_MODEL
-    messages = data.get("messages", [])
     stream = data.get("stream", True)
-    options = data.get("options", {})
-
-    openai_payload = {
-        "model": DEFAULT_MODEL,
-        "messages": messages,
-        "stream": stream,
-        **translate_options_to_openai(options),
-    }
+    openai_payload = ollama_request_to_openai(data)
 
     t0 = time.time()
-    logger.info(f"POST /api/chat model={model} stream={stream} msgs={len(messages)}")
+    num_tools = len(openai_payload.get("tools", []))
+    logger.info(
+        f"POST /api/chat model={model} stream={stream} msgs={len(openai_payload.get('messages', []))} tools={num_tools}"
+    )
 
     if not stream:
         resp = await http_client.post(
@@ -228,7 +358,7 @@ async def api_chat(req: Request):
         usage = res_json.get("usage", {})
         duration_ns = int((time.time() - t0) * 1e9)
 
-        ollama_resp = {
+        ollama_resp: Dict[str, Any] = {
             "model": model,
             "created_at": now_iso(),
             "message": {
@@ -243,12 +373,43 @@ async def api_chat(req: Request):
         }
         if msg.get("reasoning_content"):
             ollama_resp["message"]["thinking"] = msg["reasoning_content"]
+        if msg.get("tool_calls"):
+            ollama_resp["message"]["tool_calls"] = openai_tool_calls_to_ollama(msg["tool_calls"])
         return JSONResponse(ollama_resp)
 
     # Streaming mode
     async def chat_stream_generator() -> AsyncGenerator[bytes, None]:
         total_prompt_tokens = 0
         total_completion_tokens = 0
+        accumulated_calls: Dict[int, Dict[str, str]] = {}
+
+        def flush_tool_calls() -> Optional[bytes]:
+            if not accumulated_calls:
+                return None
+            ordered = [
+                {
+                    "id": accumulated_calls[i]["id"],
+                    "type": "function",
+                    "function": {
+                        "name": accumulated_calls[i]["name"],
+                        "arguments": accumulated_calls[i]["arguments"],
+                    },
+                }
+                for i in sorted(accumulated_calls.keys())
+            ]
+            accumulated_calls.clear()
+            item = {
+                "model": model,
+                "created_at": now_iso(),
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": openai_tool_calls_to_ollama(ordered),
+                },
+                "done": False,
+            }
+            return json.dumps(item).encode("utf-8") + b"\n"
+
         async with http_client.stream(
             "POST",
             f"{STRATA_BASE_URL}/v1/chat/completions",
@@ -262,8 +423,10 @@ async def api_chat(req: Request):
                     break
                 try:
                     chunk = json.loads(data_str)
-                    choice = chunk.get("choices", [{}])[0]
+                    choices = chunk.get("choices", [])
+                    choice = choices[0] if choices else {}
                     delta = choice.get("delta", {})
+                    finish_reason = choice.get("finish_reason")
                     usage = chunk.get("usage")
                     if usage:
                         total_prompt_tokens = usage.get("prompt_tokens", total_prompt_tokens)
@@ -272,6 +435,7 @@ async def api_chat(req: Request):
                     content_delta = delta.get("content")
                     reasoning_delta = delta.get("reasoning_content")
 
+                    # Handle streaming content or reasoning deltas
                     if content_delta or reasoning_delta:
                         item = {
                             "model": model,
@@ -285,8 +449,32 @@ async def api_chat(req: Request):
                         if reasoning_delta:
                             item["message"]["thinking"] = reasoning_delta
                         yield json.dumps(item).encode("utf-8") + b"\n"
+
+                    # Handle streaming tool call deltas
+                    for tc_delta in delta.get("tool_calls", []):
+                        idx = tc_delta.get("index", 0)
+                        entry = accumulated_calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                        if tc_delta.get("id"):
+                            entry["id"] = tc_delta["id"]
+                        fn_delta = tc_delta.get("function", {})
+                        if fn_delta.get("name"):
+                            entry["name"] += fn_delta["name"]
+                        if fn_delta.get("arguments"):
+                            entry["arguments"] += fn_delta["arguments"]
+
+                    # If finish_reason indicates tool_calls or stop, flush accumulated tool calls
+                    if finish_reason in ("tool_calls", "stop"):
+                        flushed = flush_tool_calls()
+                        if flushed:
+                            yield flushed
+
                 except Exception as e:
                     logger.debug(f"Chunk decode error: {e}")
+
+        # Flush any remaining accumulated calls if not yet flushed
+        flushed = flush_tool_calls()
+        if flushed:
+            yield flushed
 
         duration_ns = int((time.time() - t0) * 1e9)
         final_item = {
